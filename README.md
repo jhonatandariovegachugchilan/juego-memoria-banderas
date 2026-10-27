@@ -30,3 +30,4 @@ Solo necesitas Python 3 instalado.
 cd juego_banderas
 python main.py
 ```
+

@@ -91,3 +91,4 @@ def format_time(ms):
     seconds = total_seconds % 60
     centiseconds = (ms % 1000) // 10
     return f"{minutes:02d}:{seconds:02d}:{centiseconds:02d}"
+

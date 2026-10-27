@@ -2,17 +2,19 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import time
 import math
+import random
 from game_logic import (
     MemoryGameLogic,
     STATE_MEMORIZE,
     STATE_WAITING_INPUT,
     STATE_ANIMATING,
     STATE_EVALUATING,
+    STATE_SHUFFLING,
+    STATE_PEEKING,
     STATE_GAME_OVER
 )
 from storage import load_leaderboard, save_score, is_top_score, format_time
 
-# Paleta de colores para la interfaz
 PALETTE = {
     "bg": "#0f172a",          # Azul pizarra oscuro
     "hud_bg": "#1e293b",      # HUD oscuro
@@ -20,6 +22,7 @@ PALETTE = {
     "card_back_hover": "#475569",
     "card_border": "#64748b",
     "card_matched": "#10b981",# Borde verde al acertar
+    "card_shuffle": "#f59e0b",# Borde ámbar durante barajado
     "accent": "#38bdf8",      # Azul cielo moderno
     "text": "#f8fafc",
     "text_muted": "#94a3b8",
@@ -32,7 +35,7 @@ class FlagMemoryApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Juego de Memoria de Banderas")
-        self.root.geometry("900x750")
+        self.root.geometry("920x760")
         self.root.minsize(800, 650)
         self.root.configure(bg=PALETTE["bg"])
 
@@ -42,10 +45,16 @@ class FlagMemoryApp:
 
         self.logic = None
         self.card_widgets = []
-        self.is_running = True
 
-        # Animación de flip en progreso: {card_idx: {"progress": float, "direction": int, "target": bool}}
+        # Animación de flip en progreso: {card_idx: {"scale_x": float, "phase": str, "target_revealed": bool}}
         self.animating_cards = {}
+
+        # Animación de barajado: {card_idx: {"start_r": int, "start_c": int, "target_r": int, "target_c": int}}
+        self.shuffle_animation_data = None
+        self.shuffle_start_time = 0.0
+        self.shuffle_duration = 0.8  # Segundos que dura la animación de movimiento/mezcla
+        self.peek_start_time = 0.0
+        self.peek_duration = 1.0     # Instante justo para ver las cartas tras barajar
 
         self.current_view = "MENU"
         self.setup_menu_view()
@@ -64,7 +73,6 @@ class FlagMemoryApp:
         container = tk.Frame(self.root, bg=PALETTE["bg"])
         container.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
 
-        # Título
         title_lbl = tk.Label(
             container,
             text="JUEGO DE MEMORIA\nBANDERAS DEL MUNDO",
@@ -73,9 +81,8 @@ class FlagMemoryApp:
             bg=PALETTE["bg"],
             justify=tk.CENTER
         )
-        title_lbl.pack(pady=(0, 30))
+        title_lbl.pack(pady=(0, 25))
 
-        # Cuadro de Opciones
         opts_frame = tk.Frame(container, bg=PALETTE["hud_bg"], padx=25, pady=20, highlightbackground=PALETTE["card_border"], highlightthickness=1)
         opts_frame.pack(fill=tk.X, pady=(0, 25))
 
@@ -90,10 +97,9 @@ class FlagMemoryApp:
         )
         diff_combo.pack(fill=tk.X, pady=(0, 15))
 
-        # Checkbox Mecánica Especial
         chk_shuffle = tk.Checkbutton(
             opts_frame,
-            text="Barajar al fallar (Mecánica Dinámica)",
+            text="Barajar dinámicamente con animación al fallar",
             variable=self.shuffle_var,
             font=("Segoe UI", 10),
             fg=PALETTE["text"],
@@ -104,7 +110,6 @@ class FlagMemoryApp:
         )
         chk_shuffle.pack(anchor=tk.W, pady=(0, 8))
 
-        # Checkbox Penalización
         chk_penalty = tk.Checkbutton(
             opts_frame,
             text="Penalización de +5s por cada fallo",
@@ -118,7 +123,6 @@ class FlagMemoryApp:
         )
         chk_penalty.pack(anchor=tk.W)
 
-        # Botones de Acción
         btn_play = tk.Button(
             container,
             text="▶ JUGAR",
@@ -179,7 +183,6 @@ class FlagMemoryApp:
             time_penalty_seconds=penalty_sec
         )
 
-        # 1. Header / HUD
         hud = tk.Frame(self.root, bg=PALETTE["hud_bg"], height=70, padx=20, pady=10)
         hud.pack(fill=tk.X, side=tk.TOP)
 
@@ -215,7 +218,6 @@ class FlagMemoryApp:
         )
         btn_restart.pack(side=tk.RIGHT)
 
-        # 2. Área del Tablero
         self.board_frame = tk.Frame(self.root, bg=PALETTE["bg"], padx=15, pady=15)
         self.board_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -223,7 +225,6 @@ class FlagMemoryApp:
         self.run_game_loop()
 
     def build_board(self):
-        """Construye los widgets de las cartas adaptándose a la cuadrícula."""
         for widget in self.board_frame.winfo_children():
             widget.destroy()
 
@@ -240,7 +241,6 @@ class FlagMemoryApp:
             r = i // cols
             c = i % cols
 
-            # Canvas para dibujar cada carta y renderizar animaciones suaves
             canvas = tk.Canvas(
                 self.board_frame,
                 bg=PALETTE["bg"],
@@ -255,7 +255,7 @@ class FlagMemoryApp:
         self.redraw_all_cards()
 
     def on_card_click(self, index):
-        """Maneja el evento de clic con bloqueo de inputs mientras se anima o evalúa."""
+        """Bloquea inputs si no estamos en estado de esperar clic."""
         if self.logic.state != STATE_WAITING_INPUT:
             return
 
@@ -263,31 +263,27 @@ class FlagMemoryApp:
         if card.revealed or card.matched:
             return
 
-        # Iniciar animación de flip
         self.start_flip_animation(index, target_revealed=True)
-        res = self.logic.select_card(index)
+        self.logic.select_card(index)
 
     def start_flip_animation(self, index, target_revealed):
-        """Inicia el efecto de compresión y expansión en el eje X (3D falso)."""
         self.animating_cards[index] = {
             "scale_x": 1.0,
-            "phase": "collapsing",  # collapsing -> expanding
+            "phase": "collapsing",
             "target_revealed": target_revealed
         }
 
     def update_card_animations(self):
-        """Avanza los fotogramas de animación de volteo."""
         to_delete = []
         for idx, anim in self.animating_cards.items():
             if anim["phase"] == "collapsing":
-                anim["scale_x"] -= 0.18
+                anim["scale_x"] -= 0.20
                 if anim["scale_x"] <= 0.05:
                     anim["scale_x"] = 0.05
                     anim["phase"] = "expanding"
-                    # Se cambia el estado visual de la carta en el punto medio
                     self.logic.cards[idx].revealed = anim["target_revealed"]
             elif anim["phase"] == "expanding":
-                anim["scale_x"] += 0.18
+                anim["scale_x"] += 0.20
                 if anim["scale_x"] >= 1.0:
                     anim["scale_x"] = 1.0
                     to_delete.append(idx)
@@ -297,8 +293,77 @@ class FlagMemoryApp:
         for idx in to_delete:
             del self.animating_cards[idx]
 
-    def draw_single_card(self, index, scale_x=1.0):
-        """Dibuja una carta en su respectivo canvas con soporte para escala X."""
+    # ==========================================
+    # ANIMACIÓN DE BARAJADO Y VISTAZO RÁPIDO
+    # ==========================================
+    def trigger_shuffle_sequence(self):
+        """Prepara e inicia la animación visual de barajado y luego el vistazo."""
+        cols = self.logic.config["cols"]
+        unmatched_indices = [i for i, c in enumerate(self.logic.cards) if not c.matched]
+
+        # Guardar posiciones originales (fila, columna)
+        old_pos = {i: (i // cols, i % cols) for i in unmatched_indices}
+
+        # Ejecutar el barajado lógico
+        self.logic.do_shuffle_unmatched()
+
+        # Asignar un desplazamiento oscilatorio a cada carta no emparejada
+        self.shuffle_animation_data = {}
+        for idx in unmatched_indices:
+            # Fase aleatoria y magnitud para efecto de remolino/onda
+            self.shuffle_animation_data[idx] = {
+                "angle": random.uniform(0, 2 * math.pi),
+                "speed": random.uniform(8, 14),
+                "amplitude_x": random.randint(18, 32),
+                "amplitude_y": random.randint(14, 26)
+            }
+
+        self.shuffle_start_time = time.time()
+        self.logic.state = STATE_SHUFFLING
+        self.lbl_timer.config(text="🔀 ¡Barajando cartas!")
+
+    def update_shuffle_animation(self, now):
+        """Mueve las cartas con un efecto de mezcla aleatoria vibrante."""
+        elapsed = now - self.shuffle_start_time
+        progress = elapsed / self.shuffle_duration
+
+        if progress < 1.0:
+            # Factor de caída hacia el final
+            envelope = math.sin(progress * math.pi)
+            for idx, sdata in self.shuffle_animation_data.items():
+                theta = sdata["angle"] + elapsed * sdata["speed"]
+                dx = int(math.cos(theta) * sdata["amplitude_x"] * envelope)
+                dy = int(math.sin(theta) * sdata["amplitude_y"] * envelope)
+                self.draw_single_card(idx, offset_x_shift=dx, offset_y_shift=dy, highlight_shuffle=True)
+        else:
+            # Fin de animación de mezcla -> Iniciar vistazo rápido (PEEK)
+            self.shuffle_animation_data = None
+            self.start_peek_sequence(now)
+
+    def start_peek_sequence(self, now):
+        """Voltea todas las cartas no emparejadas por un breve instante."""
+        self.logic.state = STATE_PEEKING
+        self.peek_start_time = now
+        self.lbl_timer.config(text="👀 ¡Vistazo rápido!")
+
+        # Voltear boca arriba todas las cartas que no han sido resueltas
+        for c in self.logic.cards:
+            if not c.matched:
+                c.revealed = True
+        self.redraw_all_cards()
+
+    def finish_peek_sequence(self):
+        """Oculta las cartas nuevamente y regresa al juego normal."""
+        for c in self.logic.cards:
+            if not c.matched:
+                c.revealed = False
+        self.redraw_all_cards()
+        self.logic.state = STATE_WAITING_INPUT
+
+    # ==========================================
+    # DIBUJO DE CARTAS Y BANDERAS
+    # ==========================================
+    def draw_single_card(self, index, scale_x=1.0, offset_x_shift=0, offset_y_shift=0, highlight_shuffle=False):
         canvas = self.card_widgets[index]
         card = self.logic.cards[index]
 
@@ -309,99 +374,84 @@ class FlagMemoryApp:
 
         canvas.delete("all")
 
-        # Ancho efectivo tras compresión en eje X
         card_w = max(4, int(w * scale_x))
-        offset_x = (w - card_w) // 2
+        base_x = (w - card_w) // 2 + offset_x_shift
+        base_y = offset_y_shift
 
-        # Borde y estado
-        border_color = PALETTE["card_matched"] if card.matched else PALETTE["card_border"]
-        border_width = 3 if card.matched else 1
+        if highlight_shuffle:
+            border_color = PALETTE["card_shuffle"]
+            border_width = 2
+        elif card.matched:
+            border_color = PALETTE["card_matched"]
+            border_width = 3
+        else:
+            border_color = PALETTE["card_border"]
+            border_width = 1
 
         if card.revealed or card.matched:
-            # Fondo de la carta boca arriba
             canvas.create_rectangle(
-                offset_x, 0, offset_x + card_w, h,
+                base_x, base_y, base_x + card_w, base_y + h,
                 fill="#ffffff", outline=border_color, width=border_width
             )
-            # Dibujar la bandera dentro de la carta
-            self.draw_flag(canvas, card.flag, offset_x + 6, 6, max(4, card_w - 12), max(4, h - 30))
+            self.draw_flag(canvas, card.flag, base_x + 6, base_y + 6, max(4, card_w - 12), max(4, h - 30))
             
-            # Nombre de la bandera
             if card_w > 50 and h > 50:
                 font_size = 9 if self.logic.config["rows"] <= 6 else 7
                 canvas.create_text(
-                    w // 2, h - 14,
+                    w // 2 + offset_x_shift, h - 14 + base_y,
                     text=card.flag["name"],
                     font=("Segoe UI", font_size, "bold"),
                     fill="#1e293b"
                 )
         else:
-            # Dorso de la carta boca abajo
             canvas.create_rectangle(
-                offset_x, 0, offset_x + card_w, h,
+                base_x, base_y, base_x + card_w, base_y + h,
                 fill=PALETTE["card_back"], outline=border_color, width=border_width
             )
-            # Ícono sutil en el dorso
             if card_w > 20 and h > 20:
                 canvas.create_oval(
-                    w // 2 - 8 * scale_x, h // 2 - 8,
-                    w // 2 + 8 * scale_x, h // 2 + 8,
-                    fill=PALETTE["card_border"], outline=""
+                    w // 2 - 8 * scale_x + offset_x_shift, h // 2 - 8 + base_y,
+                    w // 2 + 8 * scale_x + offset_x_shift, h // 2 + 8 + base_y,
+                    fill=PALETTE["card_shuffle"] if highlight_shuffle else PALETTE["card_border"],
+                    outline=""
                 )
 
     def draw_flag(self, canvas, flag, x, y, w, h):
-        """Dibuja de forma procedural la bandera correspondiente."""
         ftype = flag["type"]
         colors = flag["colors"]
 
         if ftype == "horizontal":
-            # 3 franjas horizontales
             h_slice = h / 3
             for i, c in enumerate(colors[:3]):
                 canvas.create_rectangle(x, y + i * h_slice, x + w, y + (i + 1) * h_slice, fill=c, outline="")
 
         elif ftype == "horizontal_two":
-            # 2 franjas horizontales
             h_slice = h / 2
             canvas.create_rectangle(x, y, x + w, y + h_slice, fill=colors[0], outline="")
             canvas.create_rectangle(x, y + h_slice, x + w, y + h, fill=colors[1], outline="")
 
         elif ftype == "vertical":
-            # 3 franjas verticales
             w_slice = w / 3
             for i, c in enumerate(colors[:3]):
                 canvas.create_rectangle(x + i * w_slice, y, x + (i + 1) * w_slice, y + h, fill=c, outline="")
 
         elif ftype == "vertical_split":
-            # Portugal (2 franjas: 2/5 verde, 3/5 rojo)
             canvas.create_rectangle(x, y, x + w * 0.4, y + h, fill=colors[0], outline="")
             canvas.create_rectangle(x + w * 0.4, y, x + w, y + h, fill=colors[1], outline="")
 
-        elif ftype == "nordic":
-            # Suecia (fondo azul, cruz amarilla)
-            canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
-            # Cruz
-            canvas.create_rectangle(x, y + h * 0.38, x + w, y + h * 0.62, fill=colors[1], outline="")
-            canvas.create_rectangle(x + w * 0.28, y, x + w * 0.45, y + h, fill=colors[1], outline="")
-
-        elif ftype == "nordic_red" or ftype == "nordic_white":
-            # Dinamarca o Finlandia
+        elif ftype == "nordic" or ftype == "nordic_red" or ftype == "nordic_white":
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
             canvas.create_rectangle(x, y + h * 0.38, x + w, y + h * 0.62, fill=colors[1], outline="")
             canvas.create_rectangle(x + w * 0.28, y, x + w * 0.45, y + h, fill=colors[1], outline="")
 
         elif ftype == "nordic_norway":
-            # Noruega
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
-            # Cruz blanca
             canvas.create_rectangle(x, y + h * 0.33, x + w, y + h * 0.67, fill=colors[2], outline="")
             canvas.create_rectangle(x + w * 0.23, y, x + w * 0.48, y + h, fill=colors[2], outline="")
-            # Cruz azul interior
             canvas.create_rectangle(x, y + h * 0.40, x + w, y + h * 0.60, fill=colors[1], outline="")
             canvas.create_rectangle(x + w * 0.28, y, x + w * 0.43, y + h, fill=colors[1], outline="")
 
         elif ftype == "swiss_cross":
-            # Suiza (rojo con cruz blanca)
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
             cx, cy = x + w / 2, y + h / 2
             cw, ch = w * 0.55, h * 0.22
@@ -409,31 +459,26 @@ class FlagMemoryApp:
             canvas.create_rectangle(cx - ch/2, cy - cw/2, cx + ch/2, cy + cw/2, fill=colors[1], outline="")
 
         elif ftype == "circle":
-            # Japón (círculo rojo)
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
             r = min(w, h) * 0.28
             canvas.create_oval(x + w/2 - r, y + h/2 - r, x + w/2 + r, y + h/2 + r, fill=colors[1], outline="")
 
         elif ftype == "colombia":
-            # Colombia (50% amarillo, 25% azul, 25% rojo)
             canvas.create_rectangle(x, y, x + w, y + h * 0.5, fill=colors[0], outline="")
             canvas.create_rectangle(x, y + h * 0.5, x + w, y + h * 0.75, fill=colors[1], outline="")
             canvas.create_rectangle(x, y + h * 0.75, x + w, y + h, fill=colors[2], outline="")
 
         elif ftype == "brazil":
-            # Brasil (verde, rombo amarillo, círculo azul)
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
             canvas.create_polygon(x + w/2, y + 2, x + w - 2, y + h/2, x + w/2, y + h - 2, x + 2, y + h/2, fill=colors[1])
             r = min(w, h) * 0.22
             canvas.create_oval(x + w/2 - r, y + h/2 - r, x + w/2 + r, y + h/2 + r, fill=colors[2], outline="")
 
         else:
-            # Dibujo estándar de franjas
             canvas.create_rectangle(x, y, x + w, y + h, fill=colors[0], outline="")
             if len(colors) > 1:
                 canvas.create_rectangle(x, y + h * 0.5, x + w, y + h, fill=colors[1], outline="")
 
-        # Borde exterior de la bandera
         canvas.create_rectangle(x, y, x + w, y + h, outline="#cbd5e1", width=1)
 
     def redraw_all_cards(self):
@@ -441,7 +486,7 @@ class FlagMemoryApp:
             self.draw_single_card(i)
 
     # ==========================================
-    # 3. GAME LOOP PRINCIPAL
+    # GAME LOOP PRINCIPAL
     # ==========================================
     def run_game_loop(self):
         if self.current_view != "GAME":
@@ -459,14 +504,13 @@ class FlagMemoryApp:
                 self.logic.start_gameplay_phase()
                 self.redraw_all_cards()
 
-        # Fase 2 y 3: Jugando
+        # Fase 2: Jugando (Esperando clic o evaluando)
         elif self.logic.state in (STATE_WAITING_INPUT, STATE_EVALUATING):
             ms = self.logic.get_current_time_ms()
             self.lbl_timer.config(text=f"Tiempo: {format_time(ms)}")
             self.lbl_errors.config(text=f"Errores: {self.logic.errors}")
             self.lbl_pairs.config(text=f"Pares: {self.logic.matches_count} / {self.logic.total_pairs}")
 
-            # Evaluación tras mostrar cartas erróneas
             if self.logic.state == STATE_EVALUATING:
                 if (now - self.logic.eval_start_time) >= self.logic.eval_duration:
                     c1_idx = self.logic.first_selected
@@ -476,22 +520,36 @@ class FlagMemoryApp:
                     if result == "win":
                         self.on_game_won()
                         return
+                    elif result == "mismatch_shuffle":
+                        # Se voltean las 2 cartas seleccionadas y se lanza la animación de barajar
+                        self.start_flip_animation(c1_idx, target_revealed=False)
+                        self.start_flip_animation(c2_idx, target_revealed=False)
+                        self.trigger_shuffle_sequence()
                     elif result == "mismatch":
-                        # Iniciar animación de regreso
                         self.start_flip_animation(c1_idx, target_revealed=False)
                         self.start_flip_animation(c2_idx, target_revealed=False)
                     elif result == "match":
                         self.redraw_all_cards()
 
-        # Actualizar animaciones de volteo
+        # Fase 3: Animación de barajado dinámico
+        elif self.logic.state == STATE_SHUFFLING:
+            ms = self.logic.get_current_time_ms()
+            self.lbl_errors.config(text=f"Errores: {self.logic.errors}")
+            self.update_shuffle_animation(now)
+
+        # Fase 4: Vistazo rápido (Peek)
+        elif self.logic.state == STATE_PEEKING:
+            ms = self.logic.get_current_time_ms()
+            if (now - self.peek_start_time) >= self.peek_duration:
+                self.finish_peek_sequence()
+
+        # Actualizar animaciones de volteo (flip)
         if self.animating_cards:
             self.update_card_animations()
 
-        # Ciclo a ~60 FPS (16ms)
         self.root.after(16, self.run_game_loop)
 
     def on_game_won(self):
-        """Muestra los resultados finales y gestiona el Leaderboard."""
         self.current_view = "GAMEOVER"
         self.redraw_all_cards()
         final_time_ms = self.logic.elapsed_time_ms
@@ -499,11 +557,10 @@ class FlagMemoryApp:
         diff = self.logic.difficulty_name
 
         qualifies = is_top_score(diff, final_time_ms, errors)
-
         self.setup_game_over_view(final_time_ms, errors, diff, qualifies)
 
     # ==========================================
-    # 4. VISTA: RESULTADOS Y LEADERBOARD
+    # VISTAS DE FIN DE JUEGO Y LEADERBOARD
     # ==========================================
     def setup_game_over_view(self, time_ms, errors, diff, qualifies):
         self.clear_root()
@@ -519,27 +576,12 @@ class FlagMemoryApp:
         info_frame = tk.Frame(container, bg=PALETTE["hud_bg"], padx=30, pady=20, highlightbackground=PALETTE["card_border"], highlightthickness=1)
         info_frame.pack(fill=tk.X, pady=(0, 20))
 
-        tk.Label(
-            info_frame, text=f"Dificultad: {diff}", font=("Segoe UI", 12),
-            fg=PALETTE["text_muted"], bg=PALETTE["hud_bg"]
-        ).pack(pady=2)
-
-        tk.Label(
-            info_frame, text=f"Tiempo Final: {format_time(time_ms)}", font=("Segoe UI", 18, "bold"),
-            fg=PALETTE["accent"], bg=PALETTE["hud_bg"]
-        ).pack(pady=5)
-
-        tk.Label(
-            info_frame, text=f"Errores cometidos: {errors}", font=("Segoe UI", 12),
-            fg=PALETTE["text"], bg=PALETTE["hud_bg"]
-        ).pack(pady=2)
+        tk.Label(info_frame, text=f"Dificultad: {diff}", font=("Segoe UI", 12), fg=PALETTE["text_muted"], bg=PALETTE["hud_bg"]).pack(pady=2)
+        tk.Label(info_frame, text=f"Tiempo Final: {format_time(time_ms)}", font=("Segoe UI", 18, "bold"), fg=PALETTE["accent"], bg=PALETTE["hud_bg"]).pack(pady=5)
+        tk.Label(info_frame, text=f"Errores cometidos: {errors}", font=("Segoe UI", 12), fg=PALETTE["text"], bg=PALETTE["hud_bg"]).pack(pady=2)
 
         if qualifies:
-            tk.Label(
-                info_frame, text="🎉 ¡Nuevo récord! Entraste en el Top 10",
-                font=("Segoe UI", 11, "bold"), fg="#fbbf24", bg=PALETTE["hud_bg"]
-            ).pack(pady=(10, 5))
-
+            tk.Label(info_frame, text="🎉 ¡Nuevo récord! Entraste en el Top 10", font=("Segoe UI", 11, "bold"), fg="#fbbf24", bg=PALETTE["hud_bg"]).pack(pady=(10, 5))
             name_frame = tk.Frame(info_frame, bg=PALETTE["hud_bg"])
             name_frame.pack(fill=tk.X, pady=(5, 0))
 
@@ -596,7 +638,6 @@ class FlagMemoryApp:
         )
         btn_back.pack(side=tk.RIGHT)
 
-        # Selector de Dificultad para filtrar
         filter_frame = tk.Frame(container, bg=PALETTE["bg"])
         filter_frame.pack(fill=tk.X, pady=(0, 15))
 
@@ -611,7 +652,6 @@ class FlagMemoryApp:
         )
         diff_combo.pack(side=tk.LEFT)
 
-        # Tabla de puntuaciones
         table_frame = tk.Frame(container, bg=PALETTE["hud_bg"], highlightbackground=PALETTE["card_border"], highlightthickness=1)
         table_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -619,7 +659,6 @@ class FlagMemoryApp:
             for w in table_frame.winfo_children():
                 w.destroy()
 
-            # Cabecera
             h_row = tk.Frame(table_frame, bg=PALETTE["card_back"], pady=8, padx=15)
             h_row.pack(fill=tk.X)
             tk.Label(h_row, text="#", font=("Segoe UI", 10, "bold"), fg=PALETTE["text_muted"], bg=PALETTE["card_back"], width=5, anchor="w").pack(side=tk.LEFT)

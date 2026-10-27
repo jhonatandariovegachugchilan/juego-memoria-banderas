@@ -7,6 +7,8 @@ STATE_MEMORIZE = "STATE_MEMORIZE"
 STATE_WAITING_INPUT = "STATE_WAITING_INPUT"
 STATE_ANIMATING = "STATE_ANIMATING"
 STATE_EVALUATING = "STATE_EVALUATING"
+STATE_SHUFFLING = "STATE_SHUFFLING"
+STATE_PEEKING = "STATE_PEEKING"
 STATE_GAME_OVER = "STATE_GAME_OVER"
 
 DIFFICULTIES = {
@@ -146,21 +148,35 @@ class MemoryGameLogic:
             
             c1.revealed = False
             c2.revealed = False
+            first_idx = self.first_selected
+            second_idx = self.second_selected
             self.first_selected = None
             self.second_selected = None
 
-            # Mecánica especial: Barajar las cartas no descubiertas
             if self.shuffle_on_error:
-                self._shuffle_unmatched_cards()
+                # El shuffle y la animación se coordinan en ui_manager
+                self.state = STATE_SHUFFLING
+                return "mismatch_shuffle"
+            else:
+                self.state = STATE_WAITING_INPUT
+                return "mismatch"
 
-            self.state = STATE_WAITING_INPUT
-            return "mismatch"
-
-    def _shuffle_unmatched_cards(self):
-        """Baraja únicamente las posiciones de las cartas aún no resueltas."""
+    def do_shuffle_unmatched(self):
+        """Ejecuta el barajado de cartas no emparejadas y devuelve mapeo (origen -> destino)."""
         unmatched_indices = [i for i, card in enumerate(self.cards) if not card.matched]
-        unmatched_cards = [self.cards[i] for i in unmatched_indices]
-        random.shuffle(unmatched_cards)
+        if len(unmatched_indices) <= 1:
+            return {}
 
-        for i, new_card in zip(unmatched_indices, unmatched_cards):
+        original_cards = [self.cards[i] for i in unmatched_indices]
+        shuffled_cards = list(original_cards)
+        
+        # Asegurar que al menos algunas posiciones cambien si hay suficientes cartas
+        for _ in range(5):
+            random.shuffle(shuffled_cards)
+            if shuffled_cards != original_cards:
+                break
+
+        for i, new_card in zip(unmatched_indices, shuffled_cards):
             self.cards[i] = new_card
+
+        return unmatched_indices
